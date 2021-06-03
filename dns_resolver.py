@@ -35,13 +35,40 @@ ROOT_IPS = [
 def print_log(*args, **kwargs):
     print(*args, **kwargs)
 
+# maps name to (timestamp, ttl, record)
+class DNSCache:
+    def __init__(self):
+        self.storage = dict()
+
+    def get_record(self, qname):
+        if qname in self.storage:
+            current_time = int(time.time())
+            (timestamp, ttl, record) = self.storage[qname]
+            if timestamp + ttl > current_time:
+                return record
+            else:
+                self.storage.pop(qname)
+        return None
+
+    
+    def replace_record(self, qname, record):
+        if not record or not record.rr:
+            return
+        current_time = int(time.time())
+        min_ttl = min(r.ttl for r in record.rr)
+        self.storage[qname] = (current_time, min_ttl, record)
+
+    def print_all(self):
+        for key in self.storage.keys():
+            print(key)
+
 # maps name to record
-GLOBAL_CACHE = dict()
+GLOBAL_CACHE = DNSCache()
 
 def lookup_recursive(qname: str, qtype: dns.QTYPE, ip_set: List[str]) -> Optional[dns.DNSRecord]:
-    if qname in GLOBAL_CACHE:
+    if GLOBAL_CACHE.get_record(qname):
         print(f"FOUND RECORD IN CACHE FOR: {qname}")
-        return GLOBAL_CACHE[qname]
+        return GLOBAL_CACHE.get_record(qname)
 
     print(f"LOOKING UP: {qname} type={qtype} ON: {ip_set}\n")
     request = dns.DNSRecord()
@@ -52,22 +79,24 @@ def lookup_recursive(qname: str, qtype: dns.QTYPE, ip_set: List[str]) -> Optiona
         if response:
             if response.rr:
                 return response
+            # if additional section exists, can go staight to ips
             elif response.ar:
                 new_ip_set = [str(r.rdata) for r in response.ar if r.rtype == dns.QTYPE.A]
                 final_res = lookup_recursive(qname, qtype, new_ip_set)
-                GLOBAL_CACHE[qname] = final_res
+                GLOBAL_CACHE.replace_record(qname, final_res)
                 return final_res
+            # else resolve nameserver ips first
             elif response.auth:
                 for auth_ns in response.auth:
                     if auth_ns.rtype == dns.QTYPE.NS:
                         auth_ns_res = lookup_recursive(str(auth_ns.rdata), dns.QTYPE.A, ROOT_IPS)
                         if auth_ns_res.rr:
-                            GLOBAL_CACHE[str(auth_ns.rdata)] = auth_ns_res
+                            GLOBAL_CACHE.replace_record(str(auth_ns.rdata), auth_ns_res)
                             for r in auth_ns_res.rr:
                                 if r.rtype == dns.QTYPE.A:
                                     final_res = lookup_recursive(qname, qtype, [str(r.rdata)])
                                     if final_res:
-                                        GLOBAL_CACHE[qname] = final_res
+                                        GLOBAL_CACHE.replace_record(qname, final_res)
                                         return final_res
     return None
 
@@ -92,7 +121,7 @@ def process_packet(packet: bytes) -> Optional[dns.DNSRecord]:
                     print()
                     return response
                 else:
-                    GLOBAL_CACHE[request.q.qname] = None
+                    GLOBAL_CACHE.replace_record(request.q.qname, None)
                     return dns.DNSRecord.reply(request)
     except dns.DNSError:
         print_log("DNS PACKET PARSING ERROR")
@@ -119,23 +148,27 @@ def resolve(name: str):
     pass
 
 def main():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("127.0.0.1", 53))
-    print_log("DNS Resolver")
-    print_log("Listening on 127.0.0.1:53...")
     try:
-        while True:
-            try:
-                packet, ret_addr = sock.recvfrom(BUFFER_SIZE)
-                response = process_packet(packet)
-                if response:
-                    sock.sendto(response.pack(), ret_addr)
-            except socket.error:
-                pass
-                continue
-    except KeyboardInterrupt:
-        sock.close()
-        exit(0)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 53))
+        print_log("DNS Resolver")
+        print_log("Listening on 127.0.0.1:53...")
+        try:
+            while True:
+                try:
+                    packet, ret_addr = sock.recvfrom(BUFFER_SIZE)
+                    response = process_packet(packet)
+                    if response:
+                        sock.sendto(response.pack(), ret_addr)
+                except socket.error:
+                    pass
+                    continue
+        except KeyboardInterrupt:
+            sock.close()
+            exit(0)
+    except socket.error:
+        print_log("Could not bind socket")
+        exit(1)
 
 
 if __name__ == "__main__":
